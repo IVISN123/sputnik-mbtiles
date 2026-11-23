@@ -1,4 +1,4 @@
-import { EARTH_RADIUS_M, ENUM_TILE_LIMIT, MERCATOR_MAX_LAT } from './constants';
+import { EARTH_RADIUS_M, EXACT_PLAN_LIMIT, MERCATOR_MAX_LAT } from './constants';
 
 export interface TileCoord {
   z: number;
@@ -14,12 +14,18 @@ export interface LngLatBounds {
 }
 
 export interface TilePlan {
+  /** Exact tiles. Empty when `approximate` is set, so a huge slider move does not allocate millions of coordinates. */
   tiles: TileCoord[];
   byZoom: Record<number, number>;
   /** Tiles inside the bounding box, before the circle test. */
   bboxCount: number;
-  /** Bounding box was too large to scan. `tiles` is empty. */
-  overflow: boolean;
+  /** Exact length of `tiles`, or a circle-area estimate when `approximate` is set. */
+  count: number;
+  /**
+   * The bounding box was too large to list on the UI thread.
+   * `count` is about (π/4) of `bboxCount`. Download still walks the real circle.
+   */
+  approximate: boolean;
 }
 
 export function clamp(value: number, min: number, max: number): number {
@@ -196,26 +202,76 @@ export function bboxTileCount(bounds: CircleBounds, z: number): number {
   return Math.max(0, xCount) * Math.max(0, yCount);
 }
 
-export function planTiles(
+function zoomSpan(minZoom: number, maxZoom: number): [number, number] {
+  const z0 = Math.max(0, Math.min(minZoom, maxZoom));
+  const z1 = Math.max(z0, Math.max(minZoom, maxZoom));
+  return [z0, z1];
+}
+
+/** Visits every Web Mercator tile whose footprint meets the circle. */
+export function forEachCircleTile(
   lat: number,
   lon: number,
   radiusM: number,
   minZoom: number,
   maxZoom: number,
-): TilePlan {
-  const z0 = Math.max(0, Math.min(minZoom, maxZoom));
-  const z1 = Math.max(z0, Math.max(minZoom, maxZoom));
+  visit: (tile: TileCoord) => void,
+): void {
+  const [z0, z1] = zoomSpan(minZoom, maxZoom);
   const bounds = circleBounds(lat, lon, radiusM);
-  let bboxCount = 0;
   for (let z = z0; z <= z1; z++) {
-    bboxCount += bboxTileCount(bounds, z);
-    if (bboxCount > ENUM_TILE_LIMIT) {
-      return { tiles: [], byZoom: {}, bboxCount, overflow: true };
+    const yMin = latToTileY(bounds.north, z);
+    const yMax = latToTileY(bounds.south, z);
+    for (const [x0, x1] of xRanges(bounds, z)) {
+      for (let x = x0; x <= x1; x++) {
+        for (let y = yMin; y <= yMax; y++) {
+          const tile = { z, x, y };
+          if (tileIntersectsCircle(tile, lat, lon, radiusM)) visit(tile);
+        }
+      }
     }
   }
+}
 
-  const tiles: TileCoord[] = [];
+/** Lazy exact list. Coordinates are produced one at a time, not stored. */
+export function* iterateCircleTiles(
+  lat: number,
+  lon: number,
+  radiusM: number,
+  minZoom: number,
+  maxZoom: number,
+): Generator<TileCoord> {
+  const [z0, z1] = zoomSpan(minZoom, maxZoom);
+  const bounds = circleBounds(lat, lon, radiusM);
+  for (let z = z0; z <= z1; z++) {
+    const yMin = latToTileY(bounds.north, z);
+    const yMax = latToTileY(bounds.south, z);
+    for (const [x0, x1] of xRanges(bounds, z)) {
+      for (let x = x0; x <= x1; x++) {
+        for (let y = yMin; y <= yMax; y++) {
+          const tile = { z, x, y };
+          if (tileIntersectsCircle(tile, lat, lon, radiusM)) yield tile;
+        }
+      }
+    }
+  }
+}
+
+const COUNT_YIELD_EVERY = 25_000;
+
+/** Exact count that yields to the UI thread on large scans. */
+export async function countCircleTiles(
+  lat: number,
+  lon: number,
+  radiusM: number,
+  minZoom: number,
+  maxZoom: number,
+): Promise<{ count: number; byZoom: Record<number, number> }> {
+  const [z0, z1] = zoomSpan(minZoom, maxZoom);
+  const bounds = circleBounds(lat, lon, radiusM);
   const byZoom: Record<number, number> = {};
+  let count = 0;
+  let steps = 0;
   for (let z = z0; z <= z1; z++) {
     const yMin = latToTileY(bounds.north, z);
     const yMax = latToTileY(bounds.south, z);
@@ -223,18 +279,57 @@ export function planTiles(
     for (const [x0, x1] of xRanges(bounds, z)) {
       for (let x = x0; x <= x1; x++) {
         for (let y = yMin; y <= yMax; y++) {
-          const tile = { z, x, y };
-          if (tileIntersectsCircle(tile, lat, lon, radiusM)) {
-            tiles.push(tile);
+          steps += 1;
+          if (tileIntersectsCircle({ z, x, y }, lat, lon, radiusM)) {
             zoomCount += 1;
+            count += 1;
+          }
+          if (steps % COUNT_YIELD_EVERY === 0) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
           }
         }
       }
     }
     if (zoomCount > 0) byZoom[z] = zoomCount;
   }
+  return { count, byZoom };
+}
 
-  return { tiles, byZoom, bboxCount, overflow: false };
+export function planTiles(
+  lat: number,
+  lon: number,
+  radiusM: number,
+  minZoom: number,
+  maxZoom: number,
+): TilePlan {
+  const [z0, z1] = zoomSpan(minZoom, maxZoom);
+  const bounds = circleBounds(lat, lon, radiusM);
+  let bboxCount = 0;
+  const bboxByZoom: Record<number, number> = {};
+  for (let z = z0; z <= z1; z++) {
+    const count = bboxTileCount(bounds, z);
+    if (count > 0) bboxByZoom[z] = count;
+    bboxCount += count;
+  }
+
+  if (bboxCount > EXACT_PLAN_LIMIT) {
+    const byZoom: Record<number, number> = {};
+    let count = 0;
+    for (const [zoom, boxCount] of Object.entries(bboxByZoom)) {
+      const estimate = Math.max(1, Math.round(boxCount * (Math.PI / 4)));
+      byZoom[Number(zoom)] = estimate;
+      count += estimate;
+    }
+    return { tiles: [], byZoom, bboxCount, count, approximate: true };
+  }
+
+  const tiles: TileCoord[] = [];
+  const byZoom: Record<number, number> = {};
+  forEachCircleTile(lat, lon, radiusM, z0, z1, (tile) => {
+    tiles.push(tile);
+    byZoom[tile.z] = (byZoom[tile.z] ?? 0) + 1;
+  });
+  return { tiles, byZoom, bboxCount, count: tiles.length, approximate: false };
 }
 
 /** Axis-aligned union of tile footprints. Antimeridian sets span the long way; callers can substitute the circle box. */

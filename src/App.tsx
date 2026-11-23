@@ -2,11 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { MapView } from './components/MapView';
 import {
   DOWNLOAD_CONCURRENCY,
-  ENUM_TILE_LIMIT,
   ESTIMATED_TILE_BYTES,
-  HARD_TILE_CAP,
+  LARGE_BYTE_ESTIMATE,
+  LARGE_TILE_COUNT,
   MAX_TILE_BYTES,
-  WARN_TILE_COUNT,
 } from './lib/constants';
 import { parseCoordinates } from './lib/coords';
 import {
@@ -31,10 +30,10 @@ import {
 } from './lib/sources';
 import { clearSecretSettings, loadSettings, saveSettings, type Settings } from './lib/storage';
 import { toArrayBuffer } from './lib/bytes';
-import { circleBounds, planTiles } from './lib/tiles';
-import { zipTiles, type ZipLayout } from './lib/zipxyz';
+import { circleBounds, countCircleTiles, iterateCircleTiles, lonLatToTile, planTiles, type TileCoord } from './lib/tiles';
+import { TileZip, type ZipLayout } from './lib/zipxyz';
 
-type Phase = 'idle' | 'probing' | 'running' | 'paused' | 'done' | 'cancelled';
+type Phase = 'idle' | 'counting' | 'probing' | 'running' | 'paused' | 'done' | 'cancelled';
 
 interface AccessState {
   key: string;
@@ -119,15 +118,10 @@ export function App() {
   const templateOk = source.id !== 'custom' || templateIsUsable(template);
   const keyOk = !source.needsKey || apiKey.trim().length > 0;
   const qgcMismatch = settings.alsoQgc && settings.qgcNoGoogle && settings.qgcProviderId === 'google-satellite';
-  const overCap = plan.overflow || plan.tiles.length > HARD_TILE_CAP;
-  const busy = phase === 'probing' || phase === 'running' || phase === 'paused';
+  const busy = phase === 'counting' || phase === 'probing' || phase === 'running' || phase === 'paused';
 
   let blockReason: string | null = null;
-  if (plan.overflow) {
-    blockReason = `В описывающем прямоугольнике больше ${formatCount(ENUM_TILE_LIMIT)} тайлов. Уменьшите радиус или диапазон масштабов. Считаются только тайлы, которые пересекает круг, но перебирать такой прямоугольник уже бессмысленно.`;
-  } else if (plan.tiles.length > HARD_TILE_CAP) {
-    blockReason = `Нужно ${formatCount(plan.tiles.length)} ${tileNoun(plan.tiles.length)}, лимит ${formatCount(HARD_TILE_CAP)}. База собирается в памяти браузера — больший файл может закрыть вкладку. Уменьшите радиус или верхний масштаб.`;
-  } else if (plan.tiles.length === 0) {
+  if (!plan.approximate && plan.count === 0) {
     blockReason = 'Круг не задевает ни одного тайла на выбранных масштабах.';
   } else if (!keyOk) {
     blockReason = 'Нужен ключ API. Он хранится только в localStorage этого браузера и уходит лишь провайдеру тайлов.';
@@ -137,8 +131,9 @@ export function App() {
     blockReason = 'В сборке QGC без Google нет слота Google Satellite. Выберите другой тип карты для файла .qgctiledb.';
   }
 
-  const estimateBytes = (plan.overflow ? ENUM_TILE_LIMIT : plan.tiles.length) * ESTIMATED_TILE_BYTES;
-  const estimateClass = overCap ? 'is-bad' : plan.tiles.length >= WARN_TILE_COUNT ? 'is-warn' : '';
+  const estimateBytes = plan.count * ESTIMATED_TILE_BYTES;
+  const largeJob = plan.count >= LARGE_TILE_COUNT || estimateBytes >= LARGE_BYTE_ESTIMATE;
+  const estimateClass = largeJob ? 'is-warn' : '';
   const shownRadius = unit === 'km' ? settings.radiusM / 1000 : settings.radiusM;
   const accessKey = `${source.id}|${template}|${apiKey}|${subdomains.join(',')}`;
   const visibleAccess = access.key === accessKey ? access : { key: accessKey, status: 'unknown' as const, message: '' };
@@ -195,9 +190,15 @@ export function App() {
     );
   }
 
+  function sampleTile(): TileCoord {
+    if (plan.tiles.length > 0) return plan.tiles[Math.floor(plan.tiles.length / 2)]!;
+    const zoom = Math.min(settings.maxZoom, Math.max(settings.minZoom, 12));
+    return lonLatToTile(settings.lon, settings.lat, zoom);
+  }
+
   async function checkAccess() {
-    if (!templateOk || !keyOk || plan.tiles.length === 0) return;
-    const tile = plan.tiles[Math.min(plan.tiles.length - 1, Math.floor(plan.tiles.length / 2))] ?? plan.tiles[0]!;
+    if (!templateOk || !keyOk || (!plan.approximate && plan.count === 0)) return;
+    const tile = sampleTile();
     const url = buildTileUrl(source, tile, { template, subdomains, key: apiKey });
     setAccess({ key: accessKey, status: 'checking', message: 'Проверяю один тайл…' });
     const result = await probeTileUrl(url);
@@ -212,13 +213,31 @@ export function App() {
     if (busy || blockReason) return;
     setBanner('');
     setFiles(null);
-    const tiles = plan.tiles;
     const control = new PauseController();
     controlRef.current = control;
-    const urlFor = (tile: { z: number; x: number; y: number }) =>
-      buildTileUrl(source, tile, { template, subdomains, key: apiKey });
+    const urlFor = (tile: TileCoord) => buildTileUrl(source, tile, { template, subdomains, key: apiKey });
+    let tiles: Iterable<TileCoord> = plan.tiles;
+    let total = plan.count;
+    if (plan.approximate) {
+      setPhase('counting');
+      const exact = await countCircleTiles(settings.lat, settings.lon, settings.radiusM, settings.minZoom, settings.maxZoom);
+      if (control.isCancelled()) {
+        setPhase('cancelled');
+        setBanner('Подсчёт отменён. Файл не сохранён.');
+        controlRef.current = null;
+        return;
+      }
+      if (exact.count === 0) {
+        setPhase('idle');
+        setBanner('Круг не задевает ни одного тайла на выбранных масштабах.');
+        controlRef.current = null;
+        return;
+      }
+      tiles = iterateCircleTiles(settings.lat, settings.lon, settings.radiusM, settings.minZoom, settings.maxZoom);
+      total = exact.count;
+    }
     setPhase('probing');
-    const probe = await probeTileUrl(urlFor(tiles[0]!), control.signal);
+    const probe = await probeTileUrl(urlFor(sampleTile()), control.signal);
     setAccess({ key: accessKey, status: probe.ok ? 'ok' : 'bad', message: probe.message });
     if (!probe.ok || control.isCancelled()) {
       setPhase(control.isCancelled() ? 'cancelled' : 'idle');
@@ -253,17 +272,17 @@ export function App() {
       : null;
 
     setPhase('running');
-    setProgress({ total: tiles.length, completed: 0, failed: 0, bytes: 0, inFlight: 0 });
+    setProgress({ total, completed: 0, failed: 0, bytes: 0, inFlight: 0 });
     try {
       const result = await downloadTiles({
         tiles,
+        total,
         urlFor,
         control,
         concurrency: DOWNLOAD_CONCURRENCY,
         maxTileBytes: MAX_TILE_BYTES,
         onTile: (tile, bytes, format) => {
           mbtiles.addTile(tile, bytes, format);
-          qgc?.addTile(tile, bytes, format);
         },
         onProgress: (next) => {
           const now = performance.now();
@@ -274,7 +293,7 @@ export function App() {
         },
       });
       setProgress({
-        total: tiles.length,
+        total,
         completed: result.completed,
         failed: result.failed.length,
         bytes: result.bytes,
@@ -297,14 +316,19 @@ export function App() {
         return;
       }
 
-      const built = mbtiles.finish();
+      let qgcBytes: Uint8Array | null = null;
+      if (qgc) {
+        mbtiles.eachTile((tile, data) => qgc.addTile(tile, data, mbtiles.format));
+        qgcBytes = qgc.finish();
+        qgc.close();
+      }
       let zip: Uint8Array | null = null;
       if (settings.alsoZip) {
-        const packed: Array<{ tile: { z: number; x: number; y: number }; data: Uint8Array }> = [];
-        mbtiles.eachTile((tile, data) => packed.push({ tile, data }));
-        zip = zipTiles(packed, settings.zipLayout, built.format === 'png' ? 'png' : 'jpg');
+        const zipBuilder = new TileZip(settings.zipLayout, mbtiles.format === 'png' ? 'png' : 'jpg');
+        mbtiles.eachTile((tile, data) => zipBuilder.add(tile, data));
+        zip = zipBuilder.finish();
       }
-      const qgcBytes = qgc ? qgc.finish() : null;
+      const built = mbtiles.finish();
       const base = fileBasename(settings.lat, settings.lon, settings.radiusM, settings.minZoom, settings.maxZoom);
       const ready: ReadyFiles = {
         base,
@@ -569,22 +593,22 @@ export function App() {
           <section className="section">
             <h2>Оценка</h2>
             <div className={`estimate ${estimateClass}`}>
-              <strong>{plan.overflow ? `> ${formatCount(ENUM_TILE_LIMIT)}` : formatCount(plan.tiles.length)}</strong>
+              <strong>{plan.approximate ? `≈ ${formatCount(plan.count)}` : formatCount(plan.count)}</strong>
               <p>
-                {plan.overflow ? 'тайлов' : tileNoun(plan.tiles.length)}, примерно {formatBytes(estimateBytes)}. Лимит {formatCount(HARD_TILE_CAP)}. Оценка размера грубая: спутниковый JPEG бывает и 15, и 50 КБ.
-                {plan.tiles.length >= WARN_TILE_COUNT && !overCap
-                  ? ' Объём уже большой: при сохранении браузер коротко держит вторую копию базы.'
+                {tileNoun(plan.count)}, примерно {formatBytes(estimateBytes)}. Оценка размера грубая: спутниковый JPEG бывает и 15, и 50 КБ.
+                {plan.approximate ? ' Для такого круга число приблизительное, по площади. Точные тайлы перебираются при сборке и не складываются в отдельный список.' : ''}
+                {largeJob
+                  ? ' Большой объём: больше 20 000 тайлов или оценка больше 1 ГБ. Скачивание не блокируется. Тайлы сразу пишутся в базу и не держатся вторым массивом. На слабой машине вкладка может занять много памяти.'
                   : ''}
               </p>
-              {!plan.overflow && (
-                <div className="zoom-table">
-                  {Object.entries(plan.byZoom).map(([zoom, count]) => (
-                    <span key={zoom}>
-                      z{zoom} {formatCount(count)}
-                    </span>
-                  ))}
-                </div>
-              )}
+              <div className="zoom-table">
+                {Object.entries(plan.byZoom).map(([zoom, count]) => (
+                  <span key={zoom}>
+                    z{zoom} {plan.approximate ? '≈ ' : ''}
+                    {formatCount(count)}
+                  </span>
+                ))}
+              </div>
             </div>
             {blockReason && <p className="status bad">{blockReason}</p>}
           </section>
@@ -668,18 +692,20 @@ export function App() {
           </section>
 
           <button type="button" className="primary" disabled={Boolean(blockReason) || busy} onClick={() => void startDownload()}>
-            {phase === 'probing' ? 'Проверяю источник…' : phase === 'running' || phase === 'paused' ? 'Сборка идёт…' : 'Собрать файл'}
+            {phase === 'counting' ? 'Считаю тайлы…' : phase === 'probing' ? 'Проверяю источник…' : phase === 'running' || phase === 'paused' ? 'Сборка идёт…' : 'Собрать файл'}
           </button>
 
           {busy && (
             <div style={{ marginTop: 12 }}>
-              {phase !== 'probing' && (
+              {phase !== 'probing' && phase !== 'counting' && (
                 <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
                   <span style={{ width: `${pct}%` }} />
                 </div>
               )}
               <p className="mono note">
-                {phase === 'probing'
+                {phase === 'counting'
+                  ? 'Считаю тайлы внутри круга…'
+                  : phase === 'probing'
                   ? 'Проверка одного тайла…'
                   : progress
                     ? `${formatCount(progress.completed)} из ${formatCount(progress.total)} · ошибок ${formatCount(progress.failed)} · ${formatBytes(progress.bytes)}`
@@ -687,7 +713,7 @@ export function App() {
                 {phase === 'paused' ? ' · пауза' : ''}
               </p>
               <div className="actions">
-                {phase !== 'probing' && (
+                {phase !== 'probing' && phase !== 'counting' && (
                   <button type="button" className="ghost" onClick={pauseOrResume}>
                     {phase === 'paused' ? 'Продолжить' : 'Пауза'}
                   </button>

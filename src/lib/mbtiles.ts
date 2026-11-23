@@ -1,6 +1,6 @@
 import type { Database, SqlJsStatic } from 'sql.js';
 import type { RasterFormat } from './images';
-import { tileBounds, unionTileBounds, xyzToTmsY, type LngLatBounds, type TileCoord } from './tiles';
+import { tileBounds, xyzToTmsY, type LngLatBounds, type TileCoord } from './tiles';
 
 export interface MbtilesDraft {
   name: string;
@@ -10,20 +10,23 @@ export interface MbtilesDraft {
   centerLat: number;
 }
 
-interface StoredTile {
-  z: number;
-  x: number;
-  y: number;
-  format: RasterFormat;
-}
+const INSERT_BATCH = 128;
 
 /**
  * MBTiles 1.1 writer. `tiles.tile_row` is TMS: `(2^z - 1) - xyzY`.
- * The database lives in the sql.js heap; call `close()` after `export()` so the copy can be collected.
+ * Each blob is copied into the sql.js heap on insert and is not retained in JavaScript.
+ * Journaling is off so SQLite does not keep a second copy of fresh pages.
+ * Call `close()` immediately after `finish()` so the heap copy can be collected.
  */
 export class MbtilesBuilder {
-  private readonly tiles: StoredTile[] = [];
   private begun = false;
+  private pending = 0;
+  private tileCount = 0;
+  private jpgCount = 0;
+  private pngCount = 0;
+  private minZoom = Number.POSITIVE_INFINITY;
+  private maxZoom = 0;
+  private bounds: LngLatBounds | null = null;
 
   private constructor(
     private db: Database | null,
@@ -32,7 +35,7 @@ export class MbtilesBuilder {
 
   static create(SQL: SqlJsStatic, draft: MbtilesDraft): MbtilesBuilder {
     const db = new SQL.Database();
-    db.run('PRAGMA journal_mode = MEMORY');
+    db.run('PRAGMA journal_mode = OFF');
     db.run('PRAGMA synchronous = OFF');
     db.exec(`
       CREATE TABLE metadata (name TEXT, value TEXT);
@@ -61,24 +64,28 @@ export class MbtilesBuilder {
       tileRow,
       data,
     ]);
-    this.tiles.push({ z: tile.z, x: tile.x, y: tile.y, format });
+    this.note(tile, format);
+    this.pending += 1;
+    if (this.pending >= INSERT_BATCH) this.commitBatch();
   }
 
   get count(): number {
-    return this.tiles.length;
+    return this.tileCount;
+  }
+
+  get format(): RasterFormat {
+    return this.pngCount > this.jpgCount ? 'png' : 'jpg';
   }
 
   finish(): { bytes: Uint8Array; format: RasterFormat; bounds: LngLatBounds; minZoom: number; maxZoom: number } {
     const db = this.requireDb();
-    if (this.tiles.length === 0) {
+    if (this.tileCount === 0 || !this.bounds) {
       throw new Error('Нет ни одного тайла — файл MBTiles не создан');
     }
-    const zooms = this.tiles.map((tile) => tile.z);
-    const minZoom = Math.min(...zooms);
-    const maxZoom = Math.max(...zooms);
-    const bounds = unionTileBounds(this.tiles);
-    if (!bounds) throw new Error('Не удалось посчитать границы тайлов');
-    const format = majorityFormat(this.tiles);
+    const minZoom = this.minZoom;
+    const maxZoom = this.maxZoom;
+    const bounds = this.bounds;
+    const format = this.format;
     const centerZoom = Math.round((minZoom + maxZoom) / 2);
     const metadata: Array<[string, string]> = [
       ['name', this.draft.name],
@@ -102,7 +109,10 @@ export class MbtilesBuilder {
     return { bytes: db.export(), format, bounds, minZoom, maxZoom };
   }
 
-  /** Read tiles back out (XYZ y) for the optional ZIP. Call before `close()`. */
+  /**
+   * One tile at a time, copied out of the wasm heap before the next row.
+   * Callers must not accumulate the buffers if they want a single copy of the imagery.
+   */
   eachTile(visit: (tile: TileCoord, data: Uint8Array) => void): void {
     const db = this.requireDb();
     const stmt = db.prepare('SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles');
@@ -111,10 +121,36 @@ export class MbtilesBuilder {
       const z = Number(row[0]);
       const x = Number(row[1]);
       const tmsY = Number(row[2]);
-      const data = toBytes(row[3]);
+      const data = toBytes(row[3]).slice();
       visit({ z, x, y: xyzToTmsY(tmsY, z) }, data);
     }
     stmt.free();
+  }
+
+  private note(tile: TileCoord, format: RasterFormat): void {
+    this.tileCount += 1;
+    if (format === 'png') this.pngCount += 1;
+    else this.jpgCount += 1;
+    this.minZoom = Math.min(this.minZoom, tile.z);
+    this.maxZoom = Math.max(this.maxZoom, tile.z);
+    const footprint = tileBounds(tile.z, tile.x, tile.y);
+    if (!this.bounds) {
+      this.bounds = footprint;
+      return;
+    }
+    this.bounds = {
+      west: Math.min(this.bounds.west, footprint.west),
+      south: Math.min(this.bounds.south, footprint.south),
+      east: Math.max(this.bounds.east, footprint.east),
+      north: Math.max(this.bounds.north, footprint.north),
+    };
+  }
+
+  private commitBatch(): void {
+    if (!this.begun) return;
+    this.requireDb().run('COMMIT');
+    this.begun = false;
+    this.pending = 0;
   }
 
   close(): void {
@@ -126,16 +162,6 @@ export class MbtilesBuilder {
     if (!this.db) throw new Error('База MBTiles уже закрыта');
     return this.db;
   }
-}
-
-function majorityFormat(tiles: StoredTile[]): RasterFormat {
-  let jpg = 0;
-  let png = 0;
-  for (const tile of tiles) {
-    if (tile.format === 'png') png += 1;
-    else jpg += 1;
-  }
-  return png > jpg ? 'png' : 'jpg';
 }
 
 export function formatBounds(bounds: LngLatBounds): string {
