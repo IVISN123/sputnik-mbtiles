@@ -1,10 +1,15 @@
-/** Tiles kept under this count. sql.js holds the whole database in memory and copies it on export. */
-export const HARD_TILE_CAP = 3000;
+/**
+ * Above this many tiles in the circle's bounding box, the live estimate uses the
+ * circle-to-box area ratio instead of listing every tile. The download still
+ * walks the real circle and is not blocked.
+ */
+export const EXACT_PLAN_LIMIT = 50_000;
 
-/** Stop enumerating once the bounding box is this large. The circle filter is stricter, but the scan itself must stay cheap. */
-export const ENUM_TILE_LIMIT = 20_000;
+/** Informational only. A larger job still downloads. */
+export const LARGE_TILE_COUNT = 20_000;
 
-export const WARN_TILE_COUNT = 1200;
+/** Informational only, paired with {@link LARGE_TILE_COUNT}. */
+export const LARGE_BYTE_ESTIMATE = 1024 * 1024 * 1024;
 
 /** Rough JPEG satellite tile. The UI labels this as an estimate. */
 export const ESTIMATED_TILE_BYTES = 30_000;

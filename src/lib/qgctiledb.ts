@@ -60,10 +60,13 @@ export interface QgcDraft {
  * SQLite file QGroundControl imports as `.qgctiledb`.
  * Tile hash uses XYZ y, not TMS. The set is not the default set, so import creates a named set.
  */
+const QGC_INSERT_BATCH = 128;
+
 export class QgcTileDbBuilder {
   private readonly mapId: number;
   private count = 0;
   private begun = false;
+  private pending = 0;
 
   private constructor(
     private db: Database | null,
@@ -75,7 +78,7 @@ export class QgcTileDbBuilder {
   static create(SQL: SqlJsStatic, draft: QgcDraft): QgcTileDbBuilder {
     const db = new SQL.Database();
     db.run('PRAGMA foreign_keys = ON');
-    db.run('PRAGMA journal_mode = MEMORY');
+    db.run('PRAGMA journal_mode = OFF');
     db.run('PRAGMA synchronous = OFF');
     db.exec(`
       CREATE TABLE Tiles (
@@ -158,6 +161,12 @@ export class QgcTileDbBuilder {
     ]);
     db.run('INSERT INTO SetTiles(setID, tileID) VALUES (1, last_insert_rowid())');
     this.count += 1;
+    this.pending += 1;
+    if (this.pending >= QGC_INSERT_BATCH) {
+      db.run('COMMIT');
+      this.begun = false;
+      this.pending = 0;
+    }
   }
 
   finish(): Uint8Array {

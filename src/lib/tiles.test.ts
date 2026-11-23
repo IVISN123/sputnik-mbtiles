@@ -29,7 +29,7 @@ describe('circle → tiles', () => {
 
   it('keeps the tile under the center and drops a tile on the other side of the world', () => {
     const plan = planTiles(lat, lon, 400, 16, 16);
-    expect(plan.overflow).toBe(false);
+    expect(plan.approximate).toBe(false);
     const center = lonLatToTile(lon, lat, 16);
     expect(plan.tiles).toContainEqual(center);
     expect(plan.tiles.some((tile) => tile.x === 0 && tile.y === 0)).toBe(false);
@@ -43,14 +43,14 @@ describe('circle → tiles', () => {
 
   it('does not take the whole bounding box — corners outside the circle are left out', () => {
     const plan = planTiles(lat, lon, 2000, 15, 15);
-    expect(plan.overflow).toBe(false);
+    expect(plan.approximate).toBe(false);
     expect(plan.bboxCount).toBeGreaterThan(plan.tiles.length);
     expect(plan.tiles.length).toBeGreaterThan(4);
   });
 
   it('covers both sides of the antimeridian without throwing', () => {
     const plan = planTiles(65, 179.8, 80_000, 6, 6);
-    expect(plan.overflow).toBe(false);
+    expect(plan.approximate).toBe(false);
     const xs = new Set(plan.tiles.map((tile) => tile.x));
     expect(xs.has(63) || xs.has(62)).toBe(true);
     expect(xs.has(0)).toBe(true);
@@ -58,11 +58,17 @@ describe('circle → tiles', () => {
     expect(bounds.crossesAntimeridian).toBe(true);
   });
 
-  it('refuses to enumerate a huge area', () => {
-    const plan = planTiles(lat, lon, 200_000, 16, 18);
-    expect(plan.overflow).toBe(true);
-    expect(plan.tiles).toEqual([]);
-    expect(plan.bboxCount).toBeGreaterThan(20_000);
+  it('estimates a huge area without listing tiles, and still lists jobs past the old 3000 cap', () => {
+    const huge = planTiles(lat, lon, 200_000, 16, 18);
+    expect(huge.approximate).toBe(true);
+    expect(huge.tiles).toEqual([]);
+    expect(huge.count).toBeGreaterThan(20_000);
+    expect(huge.bboxCount).toBeGreaterThan(huge.count);
+
+    const pastOldCap = planTiles(lat, lon, 12_000, 16, 16);
+    expect(pastOldCap.approximate).toBe(false);
+    expect(pastOldCap.tiles.length).toBeGreaterThan(3000);
+    expect(pastOldCap.count).toBe(pastOldCap.tiles.length);
   });
 
   it('counts every zoom in range', () => {

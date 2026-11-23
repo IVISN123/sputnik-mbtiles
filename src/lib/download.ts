@@ -164,7 +164,8 @@ export function corsExplanation(detail = ''): string {
 }
 
 export async function downloadTiles(options: {
-  tiles: TileCoord[];
+  tiles: Iterable<TileCoord>;
+  total: number;
   urlFor: (tile: TileCoord) => string;
   onTile: (tile: TileCoord, bytes: Uint8Array, format: RasterFormat) => void;
   control: DownloadControl;
@@ -172,31 +173,35 @@ export async function downloadTiles(options: {
   maxTileBytes: number;
   onProgress: (progress: DownloadProgress) => void;
 }): Promise<DownloadResult> {
-  const { tiles, urlFor, onTile, control, concurrency, maxTileBytes, onProgress } = options;
+  const { tiles, total, urlFor, onTile, control, concurrency, maxTileBytes, onProgress } = options;
   const failures: TileFailure[] = [];
   let completed = 0;
   let bytes = 0;
   let inFlight = 0;
-  let cursor = 0;
   let consecutiveNetwork = 0;
   let corsBlocked = false;
   let stop = false;
+  const iterator = tiles[Symbol.iterator]();
 
   const report = () => {
-    onProgress({ total: tiles.length, completed, failed: failures.length, bytes, inFlight });
+    onProgress({ total, completed, failed: failures.length, bytes, inFlight });
+  };
+
+  const pull = (): TileCoord | null => {
+    if (stop) return null;
+    const next = iterator.next();
+    return next.done ? null : next.value;
   };
 
   const worker = async () => {
-    while (!stop && cursor < tiles.length) {
+    while (!stop) {
       try {
         await control.checkpoint();
       } catch (error) {
         if (error instanceof DownloadCancelled) return;
         throw error;
       }
-      const index = cursor;
-      cursor += 1;
-      const tile = tiles[index];
+      const tile = pull();
       if (!tile || stop) return;
       const url = urlFor(tile);
       inFlight += 1;
@@ -228,8 +233,8 @@ export async function downloadTiles(options: {
     }
   };
 
-  const poolSize = Math.max(1, Math.min(concurrency, tiles.length || 1));
-  if (tiles.length > 0) {
+  const poolSize = Math.max(1, Math.min(concurrency, total || 1));
+  if (total > 0) {
     await Promise.all(Array.from({ length: poolSize }, () => worker()));
   }
 
