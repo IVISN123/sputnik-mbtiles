@@ -37,6 +37,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Upload in this job and deploy in the next. Listing the artifact in the
+      # same job, a fraction of a second after upload, comes back empty.
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: verify
@@ -45,28 +53,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
       - name: Setup Pages
         uses: actions/configure-pages@v5
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
 
       - name: Deploy to GitHub Pages
         id: deployment
